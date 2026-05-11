@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Virtual Environment
+.env
+.env.local
+.venv
+virtualenv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker
+*.tar
+*.tar.gz
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# Secrets
+*.key
+*.pem
+*.crt
+.secrets/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# GitHub Actions Runner
+actions-runner/
+_work/
+_diag/
+
+# Project specific
+*.pyc
+instance/
+.flaskenv

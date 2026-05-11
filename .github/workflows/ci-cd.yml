@@ -1,0 +1,294 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [development, release, main]
+  pull_request:
+    branches: [development, release, main]
+
+env:
+  DOCKER_REGISTRY: docker.io
+  DOCKER_IMAGE: meigec/url-lookup-service
+
+jobs:
+  # ============================================
+  # JOB 1: Get Version from requirements.txt
+  # ============================================
+  get-version:
+    name: Get Version
+    runs-on: self-hosted
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      full_tag: ${{ steps.version.outputs.full_tag }}
+      commit_short: ${{ steps.commit.outputs.short }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Get commit short
+        id: commit
+        run: echo "short=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+      
+      - name: Read version from requirements.txt
+        id: version
+        run: |
+          VERSION=$(grep -E "^# VERSION:" requirements.txt | sed 's/# VERSION: //' | tr -d ' ')
+          if [ -z "$VERSION" ]; then
+            VERSION="0.0.0"
+            echo "No version found in requirements.txt, using 0.0.0"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version format: $VERSION, using 0.0.0"
+            VERSION="0.0.0"
+          fi
+          FULL_TAG="${VERSION}_${{ steps.commit.outputs.short }}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "full_tag=$FULL_TAG" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+          echo "Full tag: $FULL_TAG"
+  # ============================================
+  # JOB 2: Security Scan
+  # ============================================
+  security-scan:
+    name: Security Scan
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+  # ============================================
+  # JOB 3: Run Tests
+  # ============================================
+  test:
+    name: Run Tests
+    runs-on: self-hosted
+    needs: [security-scan, get-version]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install dependencies
+        run: |
+          pip3 install --user -r requirements.txt || pip3 install -r requirements.txt
+          pip3 install --user pytest || pip3 install pytest
+      
+      - name: Run tests
+        run: python3 -m pytest tests/ -v
+  # ============================================
+  # DEVELOPMENT: Build + Deploy
+  # ============================================
+  deploy-development:
+    name: Deploy to Development Cluster
+    runs-on: self-hosted
+    needs: [test, get-version]
+    if: |
+      (github.ref == 'refs/heads/development') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'development')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # - name: Switch to dev-cluster
+      #   run: |
+      #     minikube profile dev-cluster
+      #     kubectl config use-context dev-cluster
+      #     minikube status
+      
+      - name: Switch to Minikube Docker
+        run: |
+          minikube start -p url-lookup-cluster 2>/dev/null || true
+          eval $(minikube -p url-lookup-cluster docker-env)
+          docker ps
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      
+      - name: Build and push development image
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="development_${FULL_TAG}"
+          docker build -t ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} .
+          docker push ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}
+          echo "Pushed: ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}"
+      
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace development --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Create image pull secret
+        run: |
+          kubectl create secret docker-registry dockerhub-secret \
+            --docker-server=docker.io \
+            --docker-username=${{ secrets.DOCKER_USERNAME }} \
+            --docker-password=${{ secrets.DOCKER_TOKEN }} \
+            --namespace=development \
+            --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Deploy to development
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="development_${FULL_TAG}"
+          kubectl apply -f k8s/development/
+          kubectl set image deployment/url-lookup \
+            url-lookup=${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} \
+            -n development
+          kubectl rollout status deployment/url-lookup -n development --timeout=120s
+      
+      - name: Show deployed version
+        run: |
+          echo "Deployed to dev-cluster: development_${{ needs.get-version.outputs.full_tag }}"
+          kubectl get pods -n development -l app=url-lookup
+  # ============================================
+  # RELEASE: Build + Deploy
+  # ============================================
+  deploy-release:
+    name: Deploy to Release Cluster
+    runs-on: self-hosted
+    needs: [test, get-version]
+    if: |
+      (github.ref == 'refs/heads/release') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'release')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # - name: Switch to release-cluster
+      #   run: |
+      #     minikube profile release-cluster
+      #     kubectl config use-context release-cluster
+      #     minikube status
+      
+      - name: Switch to Minikube Docker
+        run: |
+          minikube start -p url-lookup-cluster 2>/dev/null || true
+          eval $(minikube -p url-lookup-cluster docker-env)
+          docker ps
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      
+      - name: Build and push release image
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="release_${FULL_TAG}"
+          docker build -t ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} .
+          docker push ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}
+          echo "Pushed: ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}"
+      
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace release --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Create image pull secret
+        run: |
+          kubectl create secret docker-registry dockerhub-secret \
+            --docker-server=docker.io \
+            --docker-username=${{ secrets.DOCKER_USERNAME }} \
+            --docker-password=${{ secrets.DOCKER_TOKEN }} \
+            --namespace=release \
+            --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Deploy to release
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="release_${FULL_TAG}"
+          kubectl apply -f k8s/release/
+          kubectl set image deployment/url-lookup \
+            url-lookup=${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} \
+            -n release
+          kubectl rollout status deployment/url-lookup -n release --timeout=120s
+      
+      - name: Show deployed version
+        run: |
+          echo "Deployed to release-cluster: release_${{ needs.get-version.outputs.full_tag }}"
+          kubectl get pods -n release -l app=url-lookup
+  # ============================================
+  # PRODUCTION: Build + Deploy
+  # ============================================
+  deploy-production:
+    name: Deploy to Production Cluster
+    runs-on: self-hosted
+    needs: [test, get-version]
+    if: |
+      (github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # - name: Switch to prod-cluster
+      #   run: |
+      #     minikube profile prod-cluster
+      #     kubectl config use-context prod-cluster
+      #     minikube status
+      
+      - name: Switch to Minikube Docker
+        run: |
+          minikube start -p url-lookup-cluster 2>/dev/null || true
+          eval $(minikube -p url-lookup-cluster docker-env)
+          docker ps
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      
+      - name: Build and push production image
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="production_${FULL_TAG}"
+          docker build -t ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} .
+          docker push ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}
+          echo "Pushed: ${{ env.DOCKER_IMAGE }}:${BRANCH_TAG}"
+      
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Create image pull secret
+        run: |
+          kubectl create secret docker-registry dockerhub-secret \
+            --docker-server=docker.io \
+            --docker-username=${{ secrets.DOCKER_USERNAME }} \
+            --docker-password=${{ secrets.DOCKER_TOKEN }} \
+            --namespace=production \
+            --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Deploy to production
+        run: |
+          FULL_TAG="${{ needs.get-version.outputs.full_tag }}"
+          BRANCH_TAG="production_${FULL_TAG}"
+          kubectl apply -f k8s/production/
+          kubectl set image deployment/url-lookup \
+            url-lookup=${{ env.DOCKER_IMAGE }}:${BRANCH_TAG} \
+            -n production
+          kubectl rollout status deployment/url-lookup -n production --timeout=180s
+      
+      - name: Show deployed version
+        run: |
+          echo "Deployed to prod-cluster: production_${{ needs.get-version.outputs.full_tag }}"
+          kubectl get pods -n production -l app=url-lookup

@@ -1,0 +1,36 @@
+services:
+  redis:
+    image: meigec/redis-sec:8-alpine # redis:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  url-lookup:
+    build: .
+    ports:
+      - "8080-8090:8080"  # Range of ports for scaling
+    environment:
+      - REDIS_HOST=redis
+      - PORT=8080
+      - REDIS_PORT=6379 
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      mode: replicated
+      replicas: 2  # Base
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+      restart_policy:
+        condition: on-failure
